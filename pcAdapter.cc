@@ -217,6 +217,7 @@ namespace pc {
     int index = 0;
     int numOfPackFields = 4;
     while (m->countFields() > numOfPackFields) {
+      std::cout << "Index: " << index << std::endl;
       apf::Field* f = m->getField(index);
       if ( f == m->findField("solution") ||
            f == m->findField("time derivative of solution") ||
@@ -228,7 +229,9 @@ namespace pc {
       m->removeField(f);
       apf::destroyField(f);
     }
+    std::cout << "passed while" << std::endl;
     m->verify();
+    std::cout << "passed verify" << std::endl;
   }
 
   int getSimFields(apf::Mesh2*& m, int simFlag, pField* sim_flds, phSolver::Input& inp) {
@@ -270,9 +273,12 @@ namespace pc {
     /* load input file for solver */
     phSolver::Input inp("solver.inp", "input.config");
     int num_flds = getNumOfMappedFields(m);
+    std::cout << "getNumOfMappedFields(m)" << std::endl;
     removeOtherFields(m,inp);
+    std::cout << "removeOtherFields(m)" << std::endl;
     pField* sim_flds = new pField[num_flds];
     getSimFields(m, in.simmetrixMesh, sim_flds, inp);
+    std::cout << "getSimFields(m)" << std::endl;
     pPList sim_fld_lst = PList_new();
     for (int i = 0; i < num_flds; i++) {
       PList_append(sim_fld_lst, sim_flds[i]);
@@ -603,7 +609,7 @@ namespace pc {
     pc::initializeCtCn(m);
 
     /* apply upper bound */
-    pc::applyMaxSizeBound(m, sizes, in);
+    // pc::applyMaxSizeBound(m, sizes, in);
 
     /* apply max number of element */
     // double cn = pc::applyMaxNumberElement(m, sizes, in);
@@ -612,41 +618,126 @@ namespace pc {
     // pc::applyMaxTimeResource(m, sizes, in, inp);
 
     /* apply upper bound */
-    // pc::applyMaxSizeBound(m, sizes, in);
-
-    //std::cout << "Passed maxSizeBound" << std::endl;
+    pc::applyMaxSizeBound(m, sizes, in);
 
     /* add mesh smooth/gradation function here */
     pc::addSmoother(m, in.gradingFactor);
-    //std::cout << "Passed applySmoother" << std::endl;
 
     /* sync mesh size over partitions */
-//    pc::syncMeshSize(m, sizes);
+    // pc::syncMeshSize(m, sizes);
 
     /* use current size field */
     if(!PCU_Comm_Self())
       printf("Start mesh adapt of setting size field\n");
 
+    apf::Field* position = m->findField("motion_coords");
+    apf::Vector3 pos;
+    apf::Field* PG_avg = m->findField("PG_avg");
+    apf::Vector3 PG;
+    double aspect_ratio = 2;
+    apf::Field* shock_param = m->findField("Shock Param");
+
     apf::Vector3 v_mag = apf::Vector3(0.0,0.0,0.0);
     apf::MeshEntity* v;
     apf::MeshIterator* vit = m->begin(0);
-    //std::cout << "entering iterator" << std::endl;
     while ((v = m->iterate(vit))) {
+    /*
+    Game plan: at each vertex, check if an adjacent element contains a shock
+    if yes - perform anisotropic refinement by PG direction and VMS size for thickness
+             tangent direction size defined by aspect ratio
+    else - perform isotropic refinement by the VMS size
+    */
+      apf::Adjacent adj_elm;
+      m->getAdjacent(v, m->getDimension(), adj_elm);
+      bool shock = false;
+      for (std::size_t i = 0; i < adj_elm.getSize(); ++i) {
+        double param = apf::getScalar(shock_param, adj_elm[i], 0);  
+        if(param > 0.5) shock = true;
+      }
+ 
       apf::getVector(sizes,v,0,v_mag);
       pVertex meshVertex = reinterpret_cast<pVertex>(v);
-      MSA_setVertexSize(adapter, meshVertex, v_mag[0]);
+
+      if(shock){
+        // anisotropic refinement based on PG direction
+        apf::getComponents(PG_avg,v,0,&PG[0]);
+        double PG_mag = sqrt(PG[0]*PG[0]+PG[1]*PG[1]+PG[2]*PG[2]);
+        double n1[3] = {PG[0]/PG_mag, PG[1]/PG_mag, PG[2]/PG_mag};
+
+        double e[3] = {1,0,0}; 
+        if(n1[1] < n1[0]){
+          if(n1[2] < n1[1]){
+            e[0] = 0;
+            e[2] = 1;
+          }
+          else{
+            e[0] = 0;
+            e[1] = 1;
+          } 
+        }
+        else if (n1[2] < n1[0]){
+          e[0] = 0;
+          e[2] = 1;
+        }
+
+        double t1[3] = {n1[1]*e[2]-e[1]*n1[2], -(n1[0]*e[2]-e[0]*n1[2]), n1[0]*e[1]-e[0]*n1[1]};
+        double t2[3] = {n1[1]*t1[2]-t1[1]*n1[2], -(n1[0]*t1[2]-t1[0]*n1[2]), n1[0]*t1[1]-t1[0]*n1[1]};
+
+        // set vector mags for element size in those directions
+        n1[0] *= v_mag[0]; n1[1] *= v_mag[0]; n1[2] *= v_mag[0];
+        t1[0] *= v_mag[0]*aspect_ratio; t1[1] *= v_mag[0]*aspect_ratio; t1[2] *= v_mag[0]*aspect_ratio;
+        t2[0] *= v_mag[0]*aspect_ratio; t2[1] *= v_mag[0]*aspect_ratio; t2[2] *= v_mag[0]*aspect_ratio;
+
+        double anisoSize[3][3] = {{n1[0],n1[1],n1[2]},{t1[0],t1[1],t1[2]},{t2[0],t2[1],t2[2]}}; 
+        if(PCU_Comm_Self()==18){
+          std::cout << "n1:\t" <<  n1[0] << "\t" << n1[1] << "\t" << n1[2] << std::endl;
+          std::cout << "t1:\t" <<  t1[0] << "\t" << t1[1] << "\t" << t1[2] << std::endl;
+          std::cout << "t2:\t" <<  t2[0] << "\t" << t2[1] << "\t" << t2[2] << std::endl << std::endl;
+        }
+
+        MSA_setAnisoVertexSize(adapter, meshVertex, anisoSize);
+      }
+      else {
+        // isotropic refinement based on VMS error
+        MSA_setVertexSize(adapter, meshVertex, v_mag[0]);
+      }
+         
+      // apf::getComponents(position,v,0,&pos[0]);
+      // double h_max = 1.5/16;
+      // double h_min = 1.5/128;
+
+      // double L1 = (-.75+-.2)/2;
+      // double delta = 0.05;
+      // double theta = 45*3.14159265/180;
+      // double tan_theta = 1;
+
+
+      // double anisoSize[3][3] = {{v_mag[0]*8,0,0},{0,v_mag[0]/sqrt(2),-v_mag[0]/sqrt(2)},{0,v_mag[0]*8/sqrt(2),v_mag[0]*8/sqrt(2)}};
+
+      // apf::getVector(sizes,v,0,v_mag);
+      // // pVertex meshVertex = reinterpret_cast<pVertex>(v);
+      // if (pos[1] < L1+delta +pos[2]/tan_theta  && pos[1] > L1-delta + pos[2]/tan_theta){
+      //   MSA_setAnisoVertexSize(adapter, meshVertex, anisoSize);
+      // }
+      // else{
+      //   MSA_setVertexSize(adapter, meshVertex, v_mag[0]);
+      // }
     }
     m->end(vit);
 
     /* write error and mesh size */
     pc::writeSequence(m, in.timeStepNumber, "error_mesh_size_");
 
+    std::cout << "write sequence complete" << std::endl;
     /* set fields to be mapped */
     PList_clear(sim_fld_lst);
     if (in.solutionMigration) {
+      std::cout << "sim_fld_lst cleared" << std::endl;
       sim_fld_lst = getSimFieldList(in, m);
+      std::cout <<  "enter MSA_setMapFields" << std::endl;
       MSA_setMapFields(adapter, sim_fld_lst);
     }
+    std::cout << "exit setupSimAdapter" << std::endl;
   }
 
   void runMeshAdapter(ph::Input& in, apf::Mesh2*& m, apf::Field*& orgSF, int step) {
